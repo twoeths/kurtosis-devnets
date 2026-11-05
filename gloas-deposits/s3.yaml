@@ -1,30 +1,37 @@
 # Scenario 3: Same-pubkey invalid builder deposits, pre-filled before the fork.
-# Before Gloas activates, fills pending_deposits with 50k invalid 0x03 builder
+# Before Gloas activates, fills pending_deposits with 50k invalid 0xb0 builder
 # deposits that all target ONE pubkey — each carrying a different invalid
-# signature — followed by a single valid 0x03 deposit for that same pubkey. At
+# signature — followed by a single valid 0xb0 deposit for that same pubkey. At
 # the fork every invalid deposit fails its signature check individually (the
 # distinct sigs defeat any batch-verify shortcut) and its ETH is burned; the
 # lone valid deposit onboards the builder.
+#
+# Launch with ethereum-package@0350d2e98735ff395b088fe8c261f0c9bb652c8a.
+# Build the image from lodestar root: docker build -f Dockerfile.dev -t lodestar:local .
+# Pass: on every CL, lodestar_stfn_gloas_onboard_builders_signature_checks{source="verified"} = 0,
+# {source="cache"} = 50001, deposits onboarded = 1 and dropped = 50000; the
+# playbook's post-fork finality check passes.
 
 participants_matrix:
   el:
     - el_type: geth
-      el_image: ethpandaops/geth:bal-devnet-6
+      el_image: ethpandaops/geth:glamsterdam-devnet-8
       el_extra_params: ["--rpc.txfeecap=0", "--rpc.gascap=0"]
   cl:
-    - cl_type: prysm
-      cl_image: ethpandaops/prysm-beacon-chain:glamsterdam-devnet-3-deposits
-  count: 1
+    - cl_type: lodestar
+      cl_image: lodestar:local
+  # more than 1 node: preverify is skipped on slots where the node is the next proposer
+  count: 4
 
 network_params:
-  gloas_fork_epoch: 1
+  # epoch 2 so the 2-epoch pre-verify window starts at genesis and all deposits land before the fork
+  gloas_fork_epoch: 2
   withdrawal_type: "0x01"
   validator_balance: 40000
   gas_limit: 250000000
   genesis_gaslimit: 250000000
 
 additional_services:
-  - dora
   - assertoor
 
 assertoor_params:
@@ -32,13 +39,10 @@ assertoor_params:
   run_stability_check: false
   run_block_proposal_check: false
   tests:
-    - file: "https://raw.githubusercontent.com/jtraglia/assertoor/refs/heads/master/playbooks/gloas-dev/deposits/s3.yaml"
+    - file: "https://raw.githubusercontent.com/twoeths/kurtosis-devnets/refs/heads/te/lodestar_fixes/playbooks/deposits/s3.yaml"
       config:
         invalidBuilderDeposits: 50000
         batchSize: 220
         pendingBatches: 32
         perSlot: 8192
         depositAmount: 1
-
-dora_params:
-  image: ethpandaops/dora:master

@@ -1,29 +1,42 @@
 # Scenario 4: Invalid validator deposits then a valid builder, in one payload.
 # Targets ONE pubkey with 5000 invalid 0x01 validator deposits followed by a
-# single valid 0x03 builder deposit (5001 total, under the per-block limit, so
-# the whole set aims to land in a single payload). The validator deposits are
-# burned as they process; the valid builder deposit onboards the builder for
-# that same pubkey.
+# single valid 0xb0 builder deposit (5001 total, under the per-block limit, so
+# the whole set aims to land in a single payload).
+#
+# Submitted before the fork (skipForkActivationCheck: true skips the playbook's
+# Gloas wait). On consensus-specs master a builder deposit sent to the validator
+# deposit contract after the fork no longer creates a builder; builders are then
+# created only through the EIP-8282 builder deposit requests. Before the fork,
+# the fork transition onboards the builder and keeps the 5000 validator deposits
+# pending.
+#
+# Launch with ethereum-package@0350d2e98735ff395b088fe8c261f0c9bb652c8a.
+# Build the image from lodestar root: docker build -f Dockerfile.dev -t lodestar:local .
+# Pass: on every CL, lodestar_stfn_gloas_onboard_builders_signature_checks{source="verified"} = 0,
+# {source="cache"} = 5001, deposits onboarded = 1, kept = 5000, dropped = 0.
+# The playbook's check_consensus_finality runs right after submission and fails
+# before anything can finalize; judge finality from the beacon API.
 
 participants_matrix:
   el:
     - el_type: geth
-      el_image: ethpandaops/geth:bal-devnet-6
+      el_image: ethpandaops/geth:glamsterdam-devnet-8
       el_extra_params: ["--rpc.txfeecap=0", "--rpc.gascap=0"]
   cl:
-    - cl_type: prysm
-      cl_image: ethpandaops/prysm-beacon-chain:glamsterdam-devnet-3-deposits
-  count: 1
+    - cl_type: lodestar
+      cl_image: lodestar:local
+  # more than 1 node: preverify is skipped on slots where the node is the next proposer
+  count: 4
 
 network_params:
-  gloas_fork_epoch: 1
+  # epoch 2 so the 2-epoch pre-verify window starts at genesis and all deposits land before the fork
+  gloas_fork_epoch: 2
   withdrawal_type: "0x01"
   validator_balance: 40000
   gas_limit: 250000000
   genesis_gaslimit: 250000000
 
 additional_services:
-  - dora
   - assertoor
 
 assertoor_params:
@@ -31,14 +44,11 @@ assertoor_params:
   run_stability_check: false
   run_block_proposal_check: false
   tests:
-    - file: "https://raw.githubusercontent.com/jtraglia/assertoor/refs/heads/master/playbooks/gloas-dev/deposits/s4.yaml"
+    - file: "https://raw.githubusercontent.com/twoeths/kurtosis-devnets/refs/heads/te/lodestar_fixes/playbooks/deposits/s4.yaml"
       config:
         validatorDeposits: 5000
         batchSize: 220
         pendingBatches: 32
         perSlot: 8192
         depositAmount: 1
-        skipForkActivationCheck: false
-
-dora_params:
-  image: ethpandaops/dora:master
+        skipForkActivationCheck: true
