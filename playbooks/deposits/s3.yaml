@@ -1,0 +1,147 @@
+id: builder-deposit-same-pubkey-spam
+name: "GLOAS: Pre-fork pending_deposits with same-pubkey builder deposits"
+description: |
+  Scenario 3 of the builder-deposit stress suite.
+
+  Builds a large pending_deposits backlog *before* GLOAS activates so the
+  fork has to process it from its first slot. The backlog is, in order:
+
+    1. `invalidBuilderDeposits` (default 50000) builder deposits with 0xb0
+       credentials, ALL targeting a single pubkey, each carrying a different
+       invalid signature.
+    2. Exactly ONE valid 0xb0 deposit for that same pubkey.
+
+  Everything is submitted in epoch 0, before the GLOAS activation slot, so at
+  the fork the queue holds the full backlog with the same-pubkey builder
+  deposits still pending. Under GLOAS, each invalid same-pubkey deposit fails
+  its signature check individually and its ETH is burned; the single valid
+  deposit then onboards the builder. The amount of ETH an attacker can burn
+  scales with `invalidBuilderDeposits` * `depositAmount`.
+
+  IMPORTANT — timing: all deposits must be EL-included before the GLOAS
+  activation slot for the pre-fork premise to hold. With gloas_fork_epoch=1
+  that window is a single epoch (~32 slots), which is tight for tens of
+  thousands of deposits. If the fill spills past activation, raise
+  gloas_fork_epoch in the kurtosis config (or lower the deposit counts).
+
+  Requires the `reuseIndex` flag on generate_batch_deposits (assertoor fork)
+  to pin every builder deposit to one derived key.
+
+  Submission is fire-and-forget at the consensus layer (awaitReceipt only);
+  awaitInclusion is NOT used because it tracks deposits by pubkey and cannot
+  count same-pubkey deposits. Ordering is enforced by submitting the stages
+  sequentially (each waits for EL receipts before the next begins).
+version: 1.0.0
+tags: [gloas, builder, deposit, eip-6110, prefork, queue, same-pubkey, burn, stability]
+timeout: 2h
+config:
+  walletPrivkey: ''
+  depositContract: '0x00000000219ab540356cBB839Cbe05303d7705Fa'
+  # Invalid-signature 0xb0 deposits piled onto the single builder pubkey.
+  # Each burns `depositAmount` ETH; raise it to burn more ETH at the fork.
+  invalidBuilderDeposits: 50000
+  # Deposits per batch tx (CL validates every BLS signature individually).
+  batchSize: 220
+  # Hard cap of in-flight batch txs so we don't drown the mempool.
+  pendingBatches: 32
+  # Deposits per slot. 8192 targets the per-block deposit limit.
+  perSlot: 8192
+  # ETH per deposit. 1 ETH is the floor (MIN_DEPOSIT_AMOUNT).
+  depositAmount: 1
+tasks:
+  - name: check_clients_are_healthy
+    title: Check that at least one client is ready
+    timeout: 5m
+    config:
+      minClientCount: 1
+
+  # Fetch specs up front (for the post-fork finality gate below). We do NOT
+  # wait for the fork before submitting — the whole point is to fill the queue
+  # while still in epoch 0.
+  - name: get_consensus_specs
+    id: get_specs
+    title: Get consensus chain specs
+
+  - name: check_consensus_block_proposals
+    title: "Wait for block proposal to fix fee estimation"
+    config:
+      blockCount: 2
+      checkLookback: 0
+
+  - name: generate_child_wallet
+    id: spam_wallet
+    title: Generate funded wallet for the pre-fork queue fill
+    config:
+      walletSeed: builder-deposit-same-pubkey
+    configVars:
+      privateKey: walletPrivkey
+      # (invalid builders + 1 valid) * depositAmount + 200 ETH headroom.
+      prefundMinBalance: '| ((.invalidBuilderDeposits + 1) * .depositAmount + 200) * 1000000000000000000'
+
+  - name: get_random_mnemonic
+    id: builder_mnemonic
+    title: Generate fresh mnemonic for the builder pubkey (only index 0 is used)
+
+  # Stage 1: invalidBuilderDeposits invalid 0xb0 deposits, ALL pinned to the
+  # index-0 builder pubkey, each with a fresh random invalid signature.
+  # Deploys the batch contract used by both stages.
+  - name: generate_batch_deposits
+    id: invalid_spam
+    title: Queue ${invalidBuilderDeposits} invalid 0xb0 deposits for one pubkey
+    timeout: 90m
+    config:
+      reuseIndex: true
+      startIndex: 0
+      invalidSigPercent: 100
+      awaitReceipt: true
+      awaitInclusion: false
+      failOnReject: true
+    configVars:
+      walletPrivkey: tasks.spam_wallet.outputs.childWallet.privkey
+      mnemonic: tasks.builder_mnemonic.outputs.mnemonic
+      depositContract: depositContract
+      batchSize: batchSize
+      limitTotal: invalidBuilderDeposits
+      limitPerSlot: perSlot
+      limitPendingBatches: pendingBatches
+      depositAmount: depositAmount
+      # 0xb0 builder withdrawal credentials — version byte + 11 zero bytes + 20-byte address.
+      withdrawalCredentials: '| "0xb0" + ("00" * 11) + (.tasks.spam_wallet.outputs.childWallet.address | ltrimstr("0x"))'
+
+  # Stage 2: one VALID 0xb0 deposit for the SAME pubkey (same builder mnemonic,
+  # same index 0), reusing the batch contract from stage 1.
+  - name: generate_batch_deposits
+    id: valid_closer
+    title: Queue the single valid 0xb0 deposit for the same pubkey
+    timeout: 15m
+    config:
+      reuseIndex: true
+      startIndex: 0
+      invalidSigPercent: 0
+      batchSize: 1
+      awaitReceipt: true
+      awaitInclusion: false
+      failOnReject: true
+    configVars:
+      walletPrivkey: tasks.spam_wallet.outputs.childWallet.privkey
+      mnemonic: tasks.builder_mnemonic.outputs.mnemonic
+      depositContract: depositContract
+      batchContract: tasks.invalid_spam.outputs.batchContract
+      limitTotal: "| 1"
+      depositAmount: depositAmount
+      withdrawalCredentials: '| "0xb0" + ("00" * 11) + (.tasks.spam_wallet.outputs.childWallet.address | ltrimstr("0x"))'
+
+  # Now let the fork hit the pre-built queue and confirm the chain survives it.
+  - name: check_consensus_slot_range
+    title: "Wait for GLOAS activation (epoch >= ${{ tasks.get_specs.outputs.specs.GLOAS_FORK_EPOCH }})"
+    timeout: 1h
+    configVars:
+      minEpochNumber: "tasks.get_specs.outputs.specs.GLOAS_FORK_EPOCH"
+
+  - name: check_consensus_finality
+    title: Verify the chain still finalizes after processing the pre-fork queue
+    timeout: 30m
+    config:
+      minFinalizedEpochs: 1
+      maxUnfinalizedEpochs: 4
+      failOnCheckMiss: true
